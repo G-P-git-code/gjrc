@@ -1,21 +1,21 @@
-# AIME 2024 evaluator — CoT + Code (ONE trial each), fixed token budgets, robust & stronger Code path
+#!/usr/bin/env python3
+# AIME 2024 evaluator — CoT + Code (ONE trial each) + Tree-of-Thought (ToT) option
 # - CoT path: compact reasoning; extracts **Final Answer: n**
-# - Code path (more capable, never-None):
-#     1) Model privately thinks (≤120 tokens), then commits: __COT_ANS__=n
-#     2) Model emits *stronger* code between custom markers (PYCODE:/ENDPYCODE)
-#        - exact integer math (math, fractions), safe bruteforce allowed
-#        - verification/assertions to self-check correctness
-#        - prints *exactly one* line "__ANS__=n"
-#     3) Model states simulated run result: __PREDICTED_OUTPUT__=n
-#   Extraction order (with validation to [0,999]):
-#       PREDICTED → DIRECT_SENTINEL → CODE_PARSE → COT_COMMIT → EXECUTE → COT_FALLBACK → ZERO
+# - Code path: structured output with (__COT_ANS__, PYCODE:/ENDPYCODE, __PREDICTED_OUTPUT__)
+# - NEW: ToT mode for BOTH CoT and Code
+#     • CoT-ToT: sample K diverse solutions (temperature>0), majority vote; tie-break via referee
+#     • Code-ToT: sample K programs/predictions, majority vote on predicted/sentinel; optional execute to break ties
 #
-# Single-chunk safe:
-# - No literal triple-backtick fences inside prompt strings; we use PYCODE:/ENDPYCODE markers.
+# Usage:
+#   python aime_tot.py                # single-shot per method (default)
+#   python aime_tot.py --tot          # enable ToT (multi-branch) for both methods
+#   python aime_tot.py --tot --k 7    # set branches (default K=6)
 #
-# Diagnostics:
-# - ONE trace print per problem showing which extraction path was used.
+# Notes:
+# - ToT here is “branch-then-select”: we sample multiple distinct solution attempts and aggregate.
+# - For Code-ToT we avoid running arbitrary code unless needed for a tie-break (last resort).
 
+import sys
 import re
 import io
 import math
@@ -24,8 +24,9 @@ import itertools
 import collections
 import functools
 import traceback
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 from contextlib import redirect_stdout
+from collections import Counter
 
 from vllm import LLM, SamplingParams
 
@@ -151,6 +152,7 @@ def strict_single_sentinel(stdout_text: str) -> Optional[int]:
     return _normalize_aime_int(_coerce_int(hits[-1].split("=")[-1]))
 
 def maybe_execute_for_last_resort(code_src: Optional[str]) -> Optional[int]:
+    """Extremely conservative execution; used only as a final tie-break fallback."""
     if not code_src:
         return None
     safe_globals = {
@@ -179,6 +181,14 @@ def maybe_execute_for_last_resort(code_src: Optional[str]) -> Optional[int]:
     except Exception:
         return None
 
+def vote_majority(ints: List[Optional[int]]) -> Tuple[Optional[int], Counter]:
+    vals = [v for v in ints if v is not None]
+    if not vals:
+        return None, Counter()
+    c = Counter(vals)
+    winner, _ = c.most_common(1)[0]
+    return winner, c
+
 
 # ========================= Model Wrapper =========================
 
@@ -197,15 +207,14 @@ class QwenRunner:
             enable_prefix_caching=True,
             max_num_seqs=16,
         )
-        # Fixed, generous but bounded generation budget
-        # ↑ Slightly larger to let the Code method produce stronger algorithms.
-        self.params = SamplingParams(
+        # Default single-shot params (deterministic)
+        self.params_single = SamplingParams(
             temperature=0.0,
             top_p=1.0,
-            repetition_penalty=1.15,  # stronger nudge against loops
+            repetition_penalty=1.10,
             n=1,
-            max_tokens=2000,          # give room for larger, more robust code
-            stop=["assistantanalysis", "assistantfinal", "to=python"]
+            max_tokens=2000,
+            stop=["assistantanalysis", "assistantfinal", "to=python"],
         )
         print("✓ Model loaded\n")
         try:
@@ -213,23 +222,35 @@ class QwenRunner:
         except Exception:
             self.tok = None
 
-    def generate_chat(self, messages: List[Dict[str, str]]) -> str:
+    def _build_prompt(self, messages: List[Dict[str, str]]) -> str:
         if self.tok is not None and hasattr(self.tok, "apply_chat_template"):
-            prompt = self.tok.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True
-            )
-        else:
-            # Fallback concatenation
-            prompt = ""
-            for m in messages:
-                role = m.get("role", "user")
-                content = m.get("content", "")
-                prompt += f"<{role}>\n{content}\n</{role}>\n"
-            prompt += "<assistant>\n"
-        out = self.llm.generate([prompt], self.params)[0]
+            return self.tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        # Fallback concatenation
+        prompt = ""
+        for m in messages:
+            role = m.get("role", "user")
+            content = m.get("content", "")
+            prompt += f"<{role}>\n{content}\n</{role}>\n"
+        prompt += "<assistant>\n"
+        return prompt
+
+    def generate_chat(self, messages: List[Dict[str, str]]) -> str:
+        prompt = self._build_prompt(messages)
+        out = self.llm.generate([prompt], self.params_single)[0]
         return (out.outputs[0].text or "").strip() if out.outputs else ""
+
+    def generate_chat_multi(self, messages: List[Dict[str, str]], n: int, temperature: float, top_p: float, max_tokens: int, stop: Optional[List[str]] = None) -> List[str]:
+        prompt = self._build_prompt(messages)
+        params = SamplingParams(
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=1.0,
+            n=n,
+            max_tokens=max_tokens,
+            stop=stop or [],
+        )
+        out = self.llm.generate([prompt], params)[0]
+        return [(o.text or "").strip() for o in out.outputs if (o.text or "").strip()]
 
 
 # ========================= Prompts =========================
@@ -246,6 +267,32 @@ Problem:
 {problem}
 """}]
 
+def cot_prompt_diverse(problem: str) -> List[Dict[str, str]]:
+    # For ToT diversity, nudge the model to consider a distinct path each sample.
+    return [
+        {"role": "system",
+         "content": "You are an AIME solver. Produce a valid solution that may use a different approach than other attempts."},
+        {"role": "user",
+         "content": f"""Solve the AIME problem and finish exactly with '**Final Answer: n**'.
+Keep steps compact (≤ 120 tokens). Consider a distinct method (algebraic, numeric, geometric, modular, or parity), whichever is most appropriate.
+
+Problem:
+{problem}
+"""}]
+
+def referee_prompt(problem: str, candidates: List[int], counts: Counter) -> List[Dict[str, str]]:
+    # Ask the model to choose among candidate integers using quick verification/heuristic checks, then output Final Answer line.
+    counts_str = ", ".join([f"{k}:{counts[k]}" for k in sorted(set(candidates))])
+    cand_str = ", ".join(str(c) for c in candidates)
+    return [
+        {"role": "system", "content": "You are an AIME verifier. Choose the most plausible answer from candidates based on quick checks. Output only the final line."},
+        {"role": "user", "content": f"""Problem:
+{problem}
+
+Candidate integers (with vote counts): {counts_str}
+Choose the most consistent candidate and output exactly one line:
+**Final Answer: n**"""}]
+
 def code_only_prompt(problem: str) -> List[Dict[str, str]]:
     """
     STRICT OUTPUT FORMAT (nothing else):
@@ -253,15 +300,11 @@ def code_only_prompt(problem: str) -> List[Dict[str, str]]:
     2) PYCODE: ... ENDPYCODE       ← code prints exactly ONE line '__ANS__=<integer>'
     3) __PREDICTED_OUTPUT__=<int>  ← the number your program will print
 
-    Code requirements (to increase accuracy):
+    Code requirements:
     - Use exact integer math; avoid floats. You MAY import: math, fractions, itertools, collections, functools.
-    - Prefer algebraic/number-theory derivation when reliable; otherwise use bounded brute force (≤ 1e7 ops).
-    - Implement a verify(ans) that checks problem conditions exactly; assert it before printing.
-    - If a closed-form attempt fails verification, fall back to brute force search with pruning.
-    - Use helper utilities: gcd/lcm, modular arithmetic, combinatorial counting as needed.
-    - Only ONE print in code (the sentinel). No input. No comments in the code. Fast (<1s typical AIME sizes).
-
-    IMPORTANT: Always include all three items (COT_ANS line, PYCODE block, PREDICTED_OUTPUT line).
+    - Prefer algebraic/number-theory derivation when reliable; otherwise bounded brute force (≤ 1e7 ops).
+    - Implement verify(ans) and assert it before printing.
+    - No input. No comments inside code. Print exactly one line.
     """
     user_text = f"""Privately compute the exact integer answer (≤120 tokens). Do NOT reveal steps.
 Then output EXACTLY in this order and nothing else:
@@ -274,19 +317,12 @@ from fractions import Fraction
 from itertools import product, permutations, combinations
 
 def verify(ans):
-    # must return True iff ans satisfies the AIME problem's requirement exactly
-    # implement deterministic checks only; no randomness
     return isinstance(ans, int) and 0 <= ans <= 999
 
 def solve():
-    # 1) Try a direct, exact derivation (integer/Fraction, modular arithmetic, etc.)
-    # 2) If uncertain, do a bounded brute force with pruning (≤ 1e7 ops)
-    # 3) Ensure ans is int in [0,999]
     ans = 0
     if not verify(ans):
-        # fallback search skeleton (edit bounds as needed in your private thinking)
         best = None
-        # example scaffold; adjust loops in your private reasoning
         for x in range(0, 1000):
             cand = x
             if verify(cand):
@@ -302,7 +338,7 @@ ENDPYCODE
 
 __PREDICTED_OUTPUT__=<integer>
 
-Replace <integer> with the correct single number for this problem, and ensure PYCODE prints exactly one line.
+Replace <integer> with the correct single number, and ensure PYCODE prints exactly one line.
 
 Problem:
 {problem}
@@ -314,17 +350,15 @@ Problem:
     ]
 
 
-# ========================= Evaluation =========================
+# ========================= Single-shot Evaluation (baseline) =========================
 
-def evaluate_problem(runner: QwenRunner, prob: Dict, index: int) -> Dict:
+def evaluate_single(runner: QwenRunner, prob: Dict, index: int) -> Dict:
     q = prob["question"]
     true_ans = int(prob["answer"])
 
-    # ---- CoT path ----
     cot_text = runner.generate_chat(cot_prompt(q))
     cot_pred = extract_final_answer(cot_text)
 
-    # ---- Code path with stronger code + layered fallbacks ----
     code_text = runner.generate_chat(code_only_prompt(q))
 
     path = None
@@ -334,32 +368,24 @@ def evaluate_problem(runner: QwenRunner, prob: Dict, index: int) -> Dict:
     src_parse = extract_answer_from_code_source(code_src) if code_src else None
     cot_commit = extract_cot_commit(code_text)
 
-    # choose in order, validating AIME range at each step
     if po is not None:
-        code_pred = po
-        path = "PREDICTED"
+        code_pred = po; path = "PREDICTED"
     elif direct is not None:
-        code_pred = direct
-        path = "DIRECT_SENTINEL"
+        code_pred = direct; path = "DIRECT_SENTINEL"
     elif src_parse is not None:
-        code_pred = src_parse
-        path = "CODE_PARSE"
+        code_pred = src_parse; path = "CODE_PARSE"
     elif cot_commit is not None:
-        code_pred = cot_commit
-        path = "COT_COMMIT"
+        code_pred = cot_commit; path = "COT_COMMIT"
     else:
         exec_pred = maybe_execute_for_last_resort(code_src)
         if exec_pred is not None:
-            code_pred = exec_pred
-            path = "EXECUTE"
+            code_pred = exec_pred; path = "EXECUTE"
         elif cot_pred is not None:
-            code_pred = cot_pred
-            path = "COT_FALLBACK"
+            code_pred = cot_pred; path = "COT_FALLBACK"
         else:
-            code_pred = 0
-            path = "ZERO_FALLBACK"
+            code_pred = 0; path = "ZERO_FALLBACK"
 
-    print(f"[TRACE P{index:02d}] path={path} po={po} direct={direct} src={'Y' if code_src else 'N'} src_parse={src_parse} cot_commit={cot_commit} cot_pred={cot_pred}")
+    print(f"[TRACE P{index:02d}] (single) path={path} po={po} direct={direct} src={'Y' if code_src else 'N'} src_parse={src_parse} cot_commit={cot_commit} cot_pred={cot_pred}")
 
     return {
         "true": true_ans,
@@ -370,9 +396,110 @@ def evaluate_problem(runner: QwenRunner, prob: Dict, index: int) -> Dict:
     }
 
 
+# ========================= ToT Evaluation =========================
+
+def tot_cot(runner: QwenRunner, problem: str, k: int = 6) -> Tuple[Optional[int], Counter, List[Optional[int]]]:
+    # Sample k diverse solutions and vote
+    outs = runner.generate_chat_multi(cot_prompt_diverse(problem), n=k, temperature=0.7, top_p=0.9, max_tokens=800)
+    preds = [extract_final_answer(o) for o in outs]
+    winner, counts = vote_majority(preds)
+    if winner is not None:
+        return winner, counts, preds
+    # Referee if nothing parseable (rare)
+    # Use any integers we managed to parse (none here), so just return None with empty counts
+    return None, Counter(), preds
+
+def tot_cot_with_referee(runner: QwenRunner, problem: str, k: int = 6) -> Tuple[Optional[int], Counter, List[Optional[int]]]:
+    ans, counts, preds = tot_cot(runner, problem, k=k)
+    if ans is not None:
+        return ans, counts, preds
+    # Try a small resample to get candidates, then referee
+    outs2 = runner.generate_chat_multi(cot_prompt_diverse(problem), n=max(3, k//2), temperature=0.75, top_p=0.9, max_tokens=800)
+    preds2 = [extract_final_answer(o) for o in outs2]
+    vals = [v for v in (preds + preds2) if v is not None]
+    if not vals:
+        return None, Counter(), preds + preds2
+    c = Counter(vals)
+    referee_out = runner.generate_chat(referee_prompt(problem, list(c.keys()), c))
+    ref_pick = extract_final_answer(referee_out)
+    if ref_pick is not None:
+        return ref_pick, c, preds + preds2
+    # Fallback majority
+    winner, c2 = vote_majority(vals)
+    return winner, c2, preds + preds2
+
+def tot_code(runner: QwenRunner, problem: str, k: int = 6) -> Tuple[Optional[int], Counter, List[Optional[int]], List[str]]:
+    outs = runner.generate_chat_multi(code_only_prompt(problem), n=k, temperature=0.6, top_p=0.9, max_tokens=1600)
+    # Prefer predicted output, then sentinel, then source parse; avoid executing unless needed
+    preds = []
+    for o in outs:
+        po = extract_predicted_output(o)
+        if po is not None:
+            preds.append(po); continue
+        di = extract_direct_sentinel(o)
+        if di is not None:
+            preds.append(di); continue
+        src = extract_code_block(o)
+        sp = extract_answer_from_code_source(src) if src else None
+        preds.append(sp)
+    winner, counts = vote_majority(preds)
+    # Tie-break: execute top-2 unique candidates’ code variants if no winner
+    if winner is None or (len(counts) > 1 and list(counts.values())[0] == list(counts.values())[1]):
+        # Attempt minimal execution of first few samples that have code blocks
+        exec_results = []
+        for o in outs[:min(3, len(outs))]:
+            src = extract_code_block(o)
+            x = maybe_execute_for_last_resort(src)
+            if x is not None:
+                exec_results.append(x)
+        if exec_results:
+            w2, c2 = vote_majority(exec_results)
+            if w2 is not None:
+                return w2, c2, preds, outs
+    return winner, counts, preds, outs
+
+
+# ========================= Driver =========================
+
+def evaluate_problem_tot(runner: QwenRunner, prob: Dict, index: int, k: int) -> Dict:
+    q = prob["question"]
+    true_ans = int(prob["answer"])
+
+    # CoT-ToT (with referee)
+    cot_pred, cot_counts, cot_all = tot_cot_with_referee(runner, q, k=k)
+
+    # Code-ToT
+    code_pred, code_counts, code_all, code_texts = tot_code(runner, q, k=k)
+
+    print(f"[TRACE P{index:02d}] (ToT) COT votes={dict(cot_counts)} COT preds={cot_all}")
+    print(f"[TRACE P{index:02d}] (ToT) CODE votes={dict(code_counts)} CODE preds={code_all}")
+
+    return {
+        "true": true_ans,
+        "cot_pred": cot_pred,
+        "code_pred": code_pred,
+        "cot_ok": (cot_pred == true_ans) if cot_pred is not None else False,
+        "code_ok": (code_pred == true_ans) if code_pred is not None else False,
+    }
+
+
 def main():
-    print("🔥 AIME 2024 — CoT + Code (ONE trial each), fixed budgets, stronger Code path")
-    print("=" * 60)
+    use_tot = "--tot" in sys.argv
+    # Optional K override
+    if "--k" in sys.argv:
+        try:
+            k = int(sys.argv[sys.argv.index("--k") + 1])
+            if k < 2 or k > 20:
+                print("K out of range [2,20]; defaulting to 6")
+                k = 6
+        except Exception:
+            k = 6
+    else:
+        k = 6
+
+    mode = "ToT (multi-branch)" if use_tot else "Single-shot"
+    print(f"🔥 AIME 2024 — CoT + Code — Mode: {mode}  |  Branches: {k if use_tot else 1}")
+    print("=" * 70)
 
     runner = QwenRunner("openai/gpt-oss-120b")
     problems = AIME_2024_PROBLEMS
@@ -382,7 +509,11 @@ def main():
     total = len(problems)
 
     for i, prob in enumerate(problems, 1):
-        res = evaluate_problem(runner, prob, i)
+        if use_tot:
+            res = evaluate_problem_tot(runner, prob, i, k=k)
+        else:
+            res = evaluate_single(runner, prob, i)
+
         cot_correct += int(res["cot_ok"])
         code_correct += int(res["code_ok"])
 
@@ -397,7 +528,6 @@ def main():
     print(f"COT : {cot_correct}/{total}  = {cot_acc:.2f}%")
     print(f"CODE: {code_correct}/{total}  = {code_acc:.2f}%")
     print("======================")
-
 
 if __name__ == "__main__":
     try:
